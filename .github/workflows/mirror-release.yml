@@ -1,0 +1,99 @@
+name: Mirror Pallino releases
+
+# Copies the stable releases of the private app repo (GabrieleGroppo/pallino) here, so anyone can download the APK.
+# Only the release is copied: its title, its notes and its assets (the APK and pallino-demo.json), never the app's
+# code. The "Source code" archives GitHub adds to every release are of this repo, which holds only this README.
+#
+# - schedule: every 30 minutes, the stable releases published there after the newest one already here. With none here
+#   yet, only the latest, so old versions are not copied by themselves.
+# - workflow_dispatch (Actions → Mirror Pallino releases → Run workflow): one release, the tag given or the latest.
+#   A release already here gets its notes and assets again.
+# - repository_dispatch, event "pallino-release" with {"tag": "vX.Y.Z"}: the same, for the app's workflow to call
+#   right after a release, with no wait for the schedule.
+# Prereleases (the dev builds) stay private.
+#
+# The app repo is private: the secret PALLINO_SOURCE_TOKEN is a fine-grained token with Contents: Read-only on
+# GabrieleGroppo/pallino and nothing else. Writing here uses this repo's own token.
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag of the release in GabrieleGroppo/pallino (empty: the latest)"
+        required: false
+        default: ""
+  repository_dispatch:
+    types: [pallino-release]
+
+permissions:
+  contents: write # to publish the releases
+
+concurrency:
+  group: mirror-release
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_REPO: GabrieleGroppo/pallino
+      SOURCE_TOKEN: ${{ secrets.PALLINO_SOURCE_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      EVENT: ${{ github.event_name }}
+      TAG: ${{ inputs.tag || github.event.client_payload.tag || '' }}
+    steps:
+      - name: Mirror
+        run: |
+          set -euo pipefail
+          if [ -z "$SOURCE_TOKEN" ]; then
+            echo "::error::The secret PALLINO_SOURCE_TOKEN isn't set: a token that reads $SOURCE_REPO (see README.md)"
+            exit 1
+          fi
+          src() { GH_TOKEN="$SOURCE_TOKEN" gh "$@"; }
+
+          latest=$(src api "repos/$SOURCE_REPO/releases/latest" --jq .tag_name)
+          if [ -n "$TAG" ]; then
+            todo=("$TAG")
+          elif [ "$EVENT" != "schedule" ]; then
+            todo=("$latest")
+          else
+            # the stable releases there, oldest first, and the newest of them already here
+            mapfile -t source < <(src release list -R "$SOURCE_REPO" --limit 100 --exclude-drafts --exclude-pre-releases \
+              --json tagName,createdAt --jq 'sort_by(.createdAt) | .[].tagName')
+            mirrored=$(gh release list --limit 100 --json tagName --jq '.[].tagName')
+            newest=-1
+            for i in "${!source[@]}"; do
+              if grep -qxF -- "${source[$i]}" <<< "$mirrored"; then newest=$i; fi
+            done
+            if [ "$newest" -lt 0 ]; then todo=("$latest"); else todo=("${source[@]:$((newest + 1))}"); fi
+          fi
+
+          for tag in "${todo[@]}"; do
+            if [ "$EVENT" = "schedule" ] && gh release view "$tag" >/dev/null 2>&1; then continue; fi
+            echo "::group::$tag"
+            release=$(src release view "$tag" -R "$SOURCE_REPO" --json name,body,isPrerelease,isDraft)
+            if [ "$(jq -r '.isPrerelease or .isDraft' <<< "$release")" = "true" ]; then
+              echo "::error::$tag is a prerelease or a draft: only the stable releases are public"
+              exit 1
+            fi
+            assets="$RUNNER_TEMP/assets-$tag"
+            rm -rf "$assets" && mkdir -p "$assets"
+            src release download "$tag" -R "$SOURCE_REPO" -D "$assets" # the assets only, not the source archives
+            jq -r .body <<< "$release" > "$RUNNER_TEMP/notes.md"
+            title=$(jq -r .name <<< "$release")
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release upload "$tag" "$assets"/* --clobber
+              gh release edit "$tag" --title "$title" --notes-file "$RUNNER_TEMP/notes.md"
+            else
+              gh release create "$tag" "$assets"/* \
+                --target "$GITHUB_SHA" \
+                --title "$title" \
+                --notes-file "$RUNNER_TEMP/notes.md" \
+                --latest="$([ "$tag" = "$latest" ] && echo true || echo false)"
+            fi
+            echo "::endgroup::"
+            echo "- [$title]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$tag)" >> "$GITHUB_STEP_SUMMARY"
+          done
+          [ "${#todo[@]}" -gt 0 ] || echo "Nothing new in $SOURCE_REPO." >> "$GITHUB_STEP_SUMMARY"
