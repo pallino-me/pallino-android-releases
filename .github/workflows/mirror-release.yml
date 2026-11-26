@@ -81,7 +81,7 @@ jobs:
             assets="$RUNNER_TEMP/assets-$tag"
             rm -rf "$assets" && mkdir -p "$assets"
             src release download "$tag" -R "$SOURCE_REPO" -D "$assets" # the assets only, not the source archives
-            jq -r .body <<< "$release" > "$RUNNER_TEMP/notes.md"
+            jq -j .body <<< "$release" > "$RUNNER_TEMP/notes.md" # -j: the notes as they are, no newline added
             title=$(jq -r .name <<< "$release")
             if gh release view "$tag" >/dev/null 2>&1; then
               gh release upload "$tag" "$assets"/* --clobber
